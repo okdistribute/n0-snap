@@ -1,0 +1,6 @@
+[application]
+name = "n0-snap"
+
+[bundle]
+identifier = "dev.flicker.prototype"
+publisher = "n0-snap"

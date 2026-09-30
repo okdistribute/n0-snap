@@ -1,0 +1,13 @@
+/target
+/dist
+/.data
+.DS_Store
+/Flicker.app
+.env
+.env.*
+*.key
+*.token
+state.json
+state.tmp
+
+/n0-snap.app
