@@ -1,6 +1,13 @@
+mod auth_ui;
+mod devices_ui;
 mod discover_ui;
+mod platform;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
+#[cfg(feature = "desktop")]
+use dioxus::desktop as native_ui;
+#[cfg(all(feature = "mobile", not(feature = "desktop")))]
+use dioxus::mobile as native_ui;
 use dioxus::prelude::*;
 use discover_ui::Discover;
 use flicker::discovery::Profile as PublicProfile;
@@ -11,25 +18,32 @@ use flicker::{
 use std::{sync::Arc, time::Duration};
 
 fn main() {
-    if let Err(e) = State::load(&data_dir()) {
-        eprintln!("Could not load n0-snap data: {e}. Your existing data was left in place.");
-        std::process::exit(1);
-    }
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus::desktop::Config::new().with_window(
-                dioxus::desktop::WindowBuilder::new()
-                    .with_title("n0-snap")
-                    .with_inner_size(dioxus::desktop::LogicalSize::new(1320.0, 860.0))
-                    .with_min_inner_size(dioxus::desktop::LogicalSize::new(860.0, 650.0)),
-            ),
-        )
-        .launch(App);
+    #[cfg(feature = "desktop")]
+    let launcher = dioxus::LaunchBuilder::desktop();
+    #[cfg(all(feature = "mobile", not(feature = "desktop")))]
+    let launcher = dioxus::LaunchBuilder::mobile();
+    let config = native_ui::Config::new()
+        .with_background_color((16, 16, 18, 255))
+        .with_custom_event_handler(|event, _| {
+            if let native_ui::tao::event::Event::Opened { urls } = event {
+                for url in urls {
+                    platform::receive_link(url.as_str());
+                }
+            }
+        });
+    #[cfg(not(target_os = "ios"))]
+    let config = config.with_window(
+        native_ui::WindowBuilder::new()
+            .with_title("n0-snap")
+            .with_inner_size(native_ui::LogicalSize::new(1320.0, 860.0))
+            .with_min_inner_size(native_ui::LogicalSize::new(860.0, 650.0)),
+    );
+    launcher.with_cfg(config).launch(auth_ui::AuthGate);
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
-    Inbox,
+    Snaps,
     Stories,
     Memories,
     Friends,
@@ -46,6 +60,7 @@ struct Viewer {
 }
 #[derive(Clone, Copy)]
 struct Ctx {
+    account: Signal<flicker::auth::Account>,
     state: Signal<State>,
     client: Signal<Option<Arc<Client>>>,
     page: Signal<Page>,
@@ -54,21 +69,36 @@ struct Ctx {
     viewer: Signal<Option<Viewer>>,
     compose: Signal<bool>,
     add: Signal<bool>,
+    add_profile: Signal<Option<PublicProfile>>,
+    add_input: Signal<String>,
+    my_code: Signal<bool>,
     tick: Signal<u64>,
 }
 
 #[component]
-fn App() -> Element {
-    let mut state = use_signal(|| State::load(&data_dir()).expect("validated state"));
+fn App(account: flicker::auth::Account, initial: State) -> Element {
+    let directory = use_signal(|| account_dir(&data_dir(), &account.profile.did));
+    let account = use_signal(|| account);
+    let mut state = use_signal(|| initial);
     let mut client = use_signal(|| None::<Arc<Client>>);
-    let page = use_signal(|| Page::Inbox);
-    let selected = use_signal(|| "mira".to_string());
+    let page = use_signal(|| {
+        if state.read().contacts.iter().any(|c| c.endpoint.is_some()) {
+            Page::Snaps
+        } else {
+            Page::Discover
+        }
+    });
+    let selected = use_signal(String::new);
     let mut toast = use_signal(String::new);
     let mut viewer = use_signal(|| None::<Viewer>);
     let compose = use_signal(|| false);
     let add = use_signal(|| false);
+    let add_profile = use_signal(|| None::<PublicProfile>);
+    let add_input = use_signal(String::new);
+    let my_code = use_signal(|| false);
     let mut tick = use_signal(now);
     let mut cx = Ctx {
+        account,
         state,
         client,
         page,
@@ -77,24 +107,43 @@ fn App() -> Element {
         viewer,
         compose,
         add,
+        add_profile,
+        add_input,
+        my_code,
         tick,
     };
     use_context_provider(|| cx);
+    use_drop(move || {
+        if let Some(node) = client.read().clone() {
+            tokio::spawn(async move {
+                node.endpoint.close().await;
+                node.local_store.endpoint.close().await;
+            });
+        }
+    });
     use_effect(move || {
-        if let Err(e) = state.read().save(&data_dir()) {
+        if let Err(e) = state.read().save(&directory.read()) {
             toast.set(format!("Could not save locally: {e}"));
         }
     });
     use_future(move || async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (friend_tx, mut friend_rx) = tokio::sync::mpsc::channel(32);
-        match Client::start_with_requests(data_dir(), tx, friend_tx).await {
+        match Client::start_with_requests(directory(), tx, friend_tx).await {
             Ok(node) => {
                 let node = Arc::new(node);
+                *node.accounts.own.write().await = Some(cx.account.read().profile.did.clone());
                 let contacts = state.read().contacts.clone();
                 for contact in contacts {
                     if let Some(addr) = &contact.endpoint {
                         node.allowed.write().await.insert(addr.id);
+                        if !contact.did.is_empty() {
+                            node.accounts
+                                .bindings
+                                .write()
+                                .await
+                                .insert(addr.id, contact.did.clone());
+                        }
                     }
                 }
                 node.declined
@@ -134,7 +183,7 @@ fn App() -> Element {
                                 ticket: Some(offer.ticket),
                                 memory_cipher: None,
                             });
-                            toast.set(format!("A new moment from {}", friend.name));
+                            toast.set(format!("New snap from {}", friend.name));
                         }
                     } }
                 }
@@ -182,11 +231,11 @@ fn App() -> Element {
                         .iter()
                         .any(|r| r.outgoing && r.invite.endpoint.id == request.invite.endpoint.id)
                 {
+                    if let Err(e) = node.authorize_friend(&request.invite).await {
+                        toast.set(format!("Could not verify connection: {e}"));
+                        continue;
+                    }
                     state.write().connect_friend(&request.invite);
-                    node.allowed
-                        .write()
-                        .await
-                        .insert(request.invite.endpoint.id);
                     toast.set(format!(
                         "{} accepted. You're connected!",
                         request.invite.name
@@ -199,6 +248,12 @@ fn App() -> Element {
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
             tick.set(now());
+            if let Some(invite) = platform::PENDING_INVITE.lock().unwrap().take() {
+                cx.add_input.set(invite);
+                cx.add_profile.set(None);
+                cx.my_code.set(false);
+                cx.add.set(true);
+            }
             if viewer
                 .read()
                 .as_ref()
@@ -221,44 +276,37 @@ fn App() -> Element {
         }
     });
     let title = match page() {
-        Page::Inbox => "Good moments. Zero forever.",
-        Page::Stories => "Today looks good on you.",
-        Page::Memories => "Some things hit different.",
-        Page::Friends => "Find your frequency.",
-        Page::Discover => "Your next favorite people.",
-        Page::Hosting => "Your space. Your rules.",
+        Page::Snaps => "Snaps",
+        Page::Stories => "Stories",
+        Page::Memories => "Memories",
+        Page::Friends => "Friends",
+        Page::Discover => "Discover",
+        Page::Hosting => "Hosting",
     };
     rsx! {
-        style { {include_str!("../assets/style.css")} }
         div { class:"app-shell",
             Sidebar {}
             main { class:"workspace",
                 header { class:"topbar",
-                    div { class:"breadcrumb", span {class:"header-cross","✳"} "PRIVATE MOMENTS / PUBLIC CONNECTIONS" }
+                    h1 {"{title}"}
                     div { class:"topbar-right",
-                        span { class:"connection", span { class:if client.read().is_some(){"dot"}else{"dot pending"} } if client.read().is_some(){"iroh connected"}else{"connecting…"} }
-                        button { class:"profile-button", title:"Profile and Snapcode", onclick:move |_|cx.page.set(Page::Friends), "Y" }
+                        span { class:"connection", span { class:if client.read().is_some(){"dot"}else{"dot pending"} } if client.read().is_some(){"Ready"}else{"Starting…"} }
+                        button { class:"secondary", disabled:client.read().is_none(), onclick:move |_|cx.my_code.set(true), Icon{name:"qr"} "My Snapcode" }
+                        button { class:"primary", disabled:client.read().is_none()||!state.read().contacts.iter().any(|c|c.endpoint.is_some()), onclick:move |_|cx.compose.set(true), Icon{name:"plus"} "New snap" }
                     }
                 }
-                section { class:"page-intro",
-                    div { class:"intro-copy", p {class:"eyebrow",span{class:"eyebrow-dash"} "SEND IT. FEEL IT. LET IT GO."} h1 {"{title}"} p {class:"muted", "Your people. Your moments. A whole lot of right now."} }
-                    div {class:"hero-orbit","aria-hidden":"true",span{class:"orbit-track"}span{class:"orbit-track second"}span{class:"orbit-number","60"}span{class:"orbit-unit","SECONDS"}span{class:"orbit-star","✳"}}
-                    button { class:"primary new-snap", onclick:move |_|cx.compose.set(true), Icon{name:"plus"} "New snap" }
-                }
                 match page() {
-                    Page::Inbox=>rsx!{ StoryStrip{} Inbox{} },
-                    Page::Stories=>rsx!{ Gallery{memories:false} },
-                    Page::Memories=>rsx!{ Gallery{memories:true} },
+                    Page::Snaps | Page::Stories | Page::Memories=>rsx!{ Gallery{page:page()} },
                     Page::Friends=>rsx!{ Friends{} },
                     Page::Discover=>rsx!{ Discover{} },
                     Page::Hosting=>rsx!{ Hosting{} },
                 }
-                footer { class:"page-footer", span {Icon{name:"spark"} "A little less forever. A lot more now."} span {"BUILT WITH IROH / EXPERIMENT 001"} }
             }
         }
         if !toast.read().is_empty() { div {class:"toast", role:"status", "{toast}" button {class:"icon-button", title:"Dismiss", onclick:move |_|toast.set(String::new()), Icon{name:"close"}}} }
         if compose() { Composer{} }
         if add() { AddFriend{} }
+        if my_code() { MySnapcode{} }
         if viewer.read().is_some() { SnapViewer{} }
     }
 }
@@ -267,170 +315,39 @@ fn App() -> Element {
 fn Sidebar() -> Element {
     let mut cx = use_context::<Ctx>();
     let nav = [
-        (Page::Inbox, "inbox", "Inbox"),
+        (Page::Snaps, "camera", "Snaps"),
         (Page::Stories, "stories", "Stories"),
         (Page::Memories, "bookmark", "Memories"),
         (Page::Discover, "search", "Discover"),
         (Page::Friends, "people", "Friends"),
     ];
-    let unread = cx
-        .state
-        .read()
-        .items
-        .iter()
-        .filter(|i| !i.outgoing && i.kind != "story" && i.opened_at.is_none() && !i.expired(now()))
-        .count();
     rsx! {
         aside {class:"sidebar",
-            a {class:"wordmark", href:"#", onclick:move |_|cx.page.set(Page::Inbox), span {class:"brand-symbol",Icon{name:"spark"}} "n0-snap" span {class:"brand-period","."} }
-            p {class:"sidebar-tagline","HERE. THEN GONE."}
-            nav { for (page,icon,label) in nav { button {class:if (cx.page)()==page{"nav-item active"}else{"nav-item"},onclick:move |_|cx.page.set(page),Icon{name:icon} "{label}" if page==Page::Inbox&&unread>0 {span {class:"nav-count","{unread}"}} if page==Page::Friends { {let count=cx.state.read().friend_requests.iter().filter(|r|!r.outgoing).count();rsx!{if count>0{span{class:"nav-count","{count}"}}}} } } } }
+            a {class:"wordmark", href:"#", onclick:move |_|cx.page.set(Page::Snaps), "n0-snap" }
+            nav { for (page,icon,label) in nav { button {class:if (cx.page)()==page{"nav-item active"}else{"nav-item"},onclick:move |_|cx.page.set(page),Icon{name:icon} "{label}" if page==Page::Friends { {let count=cx.state.read().friend_requests.iter().filter(|r|!r.outgoing).count();rsx!{if count>0{span{class:"nav-count","{count}"}}}} } } } }
             div {class:"sidebar-bottom",
-                div {class:"sixty-note",span{class:"note-spark","✳"}span {class:"sixty-number","60"} span {"seconds." br{} "make them count."} p {"No forever required."} }
-                button {class:if (cx.page)()==Page::Hosting{"nav-item active"}else{"nav-item"},onclick:move |_|cx.page.set(Page::Hosting),Icon{name:"cloud"} "Your hosting"}
-                div {class:"local-profile",div {class:"avatar you","Y"} div {strong {"{cx.state.read().settings.name}"} small {"Local profile · sign-in soon"}} }
+                button {class:if (cx.page)()==Page::Hosting{"nav-item active"}else{"nav-item"},onclick:move |_|cx.page.set(Page::Hosting),Icon{name:"cloud"} "Hosting"}
+                div {class:"local-profile",strong {"{cx.account.read().profile.label()}"} p {class:"account-handle","@{cx.account.read().profile.handle}"} auth_ui::SignOut {} }
             }
         }
     }
 }
 
 #[component]
-fn StoryStrip() -> Element {
+fn Gallery(page: Page) -> Element {
     let mut cx = use_context::<Ctx>();
-    let stories: Vec<_> = cx
-        .state
-        .read()
-        .items
-        .iter()
-        .filter(|i| i.kind == "story" && !i.expired((cx.tick)()))
-        .cloned()
-        .collect();
-    rsx! {
-        section {class:"stories-strip",
-            div {class:"section-row",h2 {"In the loop"} button {class:"text-button",onclick:move |_|cx.page.set(Page::Stories),"All stories" Icon{name:"arrow"}} }
-            div {class:"story-circles",
-                button {class:"story-circle add-story",onclick:move |_|cx.compose.set(true),span {class:"circle-inner",Icon{name:"plus"}} span {"Your story"} }
-                for item in stories.into_iter().take(8) {
-                    {let c=cx.state.read().contacts.iter().find(|c|c.id==item.contact).cloned();let label=if item.outgoing{"You".into()}else{c.map(|c|c.name.split_whitespace().next().unwrap_or("Friend").to_string()).unwrap_or("Friend".into())};let thumb=item.sample.as_deref().map(sample_uri).unwrap_or_else(||sample_uri("flowers"));
-                    rsx! {button {class:"story-circle",onclick:move |_|open_item(cx,item.clone(),false),span {class:"story-ring",img {src:"{thumb}",alt:""}} span {"{label}"} }} }
-                }
-                p {class:"stories-caption", span{class:"mini-star","✳"} "A little window into their world." br{} span{class:"mono","24 HOURS. ZERO PRESSURE."} }
-            }
-        }
-    }
-}
-
-#[component]
-fn Inbox() -> Element {
-    let mut cx = use_context::<Ctx>();
-    let mut filter = use_signal(String::new);
-    let mut unopened = use_signal(|| false);
-    let contacts: Vec<_> = cx
-        .state
-        .read()
-        .contacts
-        .iter()
-        .filter(|c| c.endpoint.is_some() || c.did.is_empty())
-        .filter(|c| {
-            format!("{} {}", c.name, c.handle)
-                .to_lowercase()
-                .contains(&filter().to_lowercase())
-        })
-        .cloned()
-        .collect();
-    rsx! {
-        section {class:"inbox-panel",
-            aside {class:"conversation-list",
-                div {class:"list-title",h2 {"Inbox"}button {class:"icon-button",title:"Add a friend",onclick:move |_|cx.add.set(true),Icon{name:"edit"}} }
-                div {class:"search",Icon{name:"search"} input {placeholder:"Find a friend",value:"{filter}",oninput:move |e|filter.set(e.value())} }
-                div {class:"filter-row",button {class:if !unopened(){"filter active"}else{"filter"},onclick:move |_|unopened.set(false),"All"}button {class:if unopened(){"filter active"}else{"filter"},onclick:move |_|unopened.set(true),"Unopened"} }
-                for contact in contacts {
-                    {let latest=cx.state.read().items.iter().rev().find(|i|i.contact==contact.id&&i.kind!="story").cloned();
-                    let fresh=latest.as_ref().is_some_and(|i|!i.outgoing&&i.opened_at.is_none()&&!i.expired((cx.tick)()));
-                    let label=match &latest{Some(i) if i.expired((cx.tick)())=>"Moment passed".into(),Some(i) if i.outgoing=>if contact.endpoint.is_none(){"Demo · stored on your host".into()}else{"Delivered over iroh".into()},Some(i) if i.opened_at.is_some()=>"Opened".into(),Some(_)=>"New snap · 60 sec".into(),None=>"Say a little hello".to_string()};
-                    let age=latest.as_ref().map(|i|relative(i.created_at)).unwrap_or_default();let id=contact.id.clone();
-                    rsx! {if !unopened()||fresh {button {class:if (cx.selected)()==contact.id{"conversation selected"}else{"conversation"},onclick:move |_|cx.selected.set(id.clone()),Avatar{contact:contact.clone()}div {class:"conversation-copy",div {strong {"{contact.name}"}span {class:"time","{age}"}}p {class:if fresh{"fresh"}else{""},if fresh {span {class:"small-square"}}"{label}"}}}}} }
-                }
-                div {class:"demo-note",span {class:"tiny-label","TRY IT OUT"}p {"Sample friends are here to explore. Add a real friend's Snapcode to connect."} }
-            }
-            Conversation{}
-        }
-    }
-}
-
-#[component]
-fn Conversation() -> Element {
-    let mut cx = use_context::<Ctx>();
-    let mut draft = use_signal(String::new);
-    let mut sending = use_signal(|| false);
-    let contact = cx
-        .state
-        .read()
-        .contacts
-        .iter()
-        .find(|c| c.id == (cx.selected)())
-        .cloned();
-    let Some(contact) = contact else {
-        return rsx! {div {class:"empty",h2{"A little hello goes a long way."}p{"Pick a friend to get started."}}};
-    };
-    let items: Vec<_> = cx
-        .state
-        .read()
-        .items
-        .iter()
-        .filter(|i| i.contact == contact.id && i.kind != "story")
-        .cloned()
-        .collect();
-    let for_send = contact.clone();
-    let demo = contact.endpoint.is_none() && contact.did.is_empty();
-    rsx! {
-        div {class:"conversation-detail",
-            header {class:"chat-header",Avatar{contact:contact.clone()}div {strong {"{contact.name}"}p {"@{contact.handle}"}}span {class:"chip",if demo{"SAMPLE FRIEND"}else if contact.endpoint.is_some(){"IROH PEER"}else{"NEEDS SNAPCODE"}} }
-            div {class:"chat-scroll",
-                div {class:"day-marker","TODAY"}
-                div {class:"conversation-greeting",span {class:"greeting-orbit",Icon{name:"spark"}}h3 {"A moment between you two."}p {"Open it. Be there. Let it go."} }
-                for item in items {
-                    {let expired=item.expired((cx.tick)());let opened=item.opened_at.is_some();let out=item.outgoing;let label=if expired{"This moment has passed"}else if item.kind=="text"{"A little message"}else if item.ticket.as_ref().is_some_and(|t|t.mime.starts_with("video")){"A video for you"}else{"A little glimpse"};
-                    let view=item.clone();
-                    rsx! {div {class:if out{"message-row outgoing"}else{"message-row"},
-                        div {class:if expired{"snap-card expired-card"}else{"snap-card"},
-                            div {class:"snap-illustration",Icon{name:if item.kind=="text"{"inbox"}else{"camera"}}span {class:"spark-one","✳"}span {class:"spark-two","✳"}span {class:"snap-tag","60 SEC"}}
-                            div {class:"snap-card-body",strong {"{label}"}p {if out{"Sent by you"}else if demo{"A sample moment from a friend"}else{"Just for your eyes. And your Memories."}}
-                                button {class:"open-button",disabled:expired,onclick:move |_|open_item(cx,view.clone(),false),if expired{"Expired"}else if opened{"Continue viewing"}else{"Open snap"}Icon{name:"arrow"}}
-                            }
-                        }
-                        p {class:"message-caption",if out{"You · "}else{"Received · "}"{relative(item.created_at)}" if item.saved{" · Saved to Memories"}}
-                    }}}
-                }
-            }
-            div {class:"chat-bottom",div {class:"privacy-line",Icon{name:"lock"}"Private over iroh. Disappearing unless saved."}
-                form {class:"message-input",onsubmit:move |_|{
-                    if draft().trim().is_empty()||sending(){return;}
-                    let bytes=draft().as_bytes().to_vec();let c=for_send.clone();sending.set(true);
-                    spawn(async move{match publish(cx,bytes,"text/plain".into(),"A little message".into(),"text".into(),vec![c]).await{Ok(())=>draft.set(String::new()),Err(e)=>cx.toast.set(e.to_string())}sending.set(false);});
-                },button {r#type:"button",class:"icon-button",title:"Send a photo or video",onclick:move |_|cx.compose.set(true),Icon{name:"plus"}}
-                input {placeholder:"Send a little something…",value:"{draft}",oninput:move |e|draft.set(e.value()),maxlength:2000}
-                button {r#type:"submit",class:"send-button",disabled:sending(),title:"Send message",Icon{name:if sending(){"clock"}else{"arrow"}}}}
-            }
-        }
-    }
-}
-
-#[component]
-fn Gallery(memories: bool) -> Element {
-    let mut cx = use_context::<Ctx>();
+    let memories = page == Page::Memories;
     let mut seen = std::collections::HashSet::new();
     let items: Vec<_> = cx
         .state
         .read()
         .items
         .iter()
-        .filter(|i| {
-            if memories {
-                i.saved
-            } else {
-                i.kind == "story" && !i.expired((cx.tick)())
-            }
+        .filter(|i| match page {
+            Page::Memories => i.saved,
+            Page::Stories => i.kind == "story" && !i.expired((cx.tick)()),
+            Page::Snaps => i.kind == "snap" && !i.expired((cx.tick)()),
+            _ => false,
         })
         .filter(|i| {
             seen.insert(
@@ -440,14 +357,15 @@ fn Gallery(memories: bool) -> Element {
                     .unwrap_or(i.id.clone()),
             )
         })
+        .rev()
         .cloned()
         .collect();
     rsx! {section {class:"gallery-section",
-        div {class:"section-row",h2 {if memories{"Your private collection"}else{"Today, through their eyes"}}span {class:"muted",if memories{"Saved on this device"}else{"Available for 24 hours"}} }
-        if items.is_empty(){div {class:"large-empty",Icon{name:if memories{"bookmark"}else{"stories"}}h2 {if memories{"Some moments are keepers."}else{"Today is a blank canvas."}}p {if memories{"Open a snap and choose Save to Memories. You'll find it here."}else{"Share a little of your day with a story."}}button {class:"primary",onclick:move |_|{if memories{cx.page.set(Page::Inbox)}else{cx.compose.set(true)}},if memories{"Explore your inbox"}else{"Add a story"}}}}
+        p {class:"muted",match page {Page::Memories=>"Saved on this device",Page::Stories=>"Available for 24 hours",_=>"Snaps can be viewed for 60 seconds after opening."}}
+        if items.is_empty(){div {class:"large-empty",h2 {match page {Page::Memories=>"No saved snaps",Page::Stories=>"No stories",_=>"No snaps"}}p {if memories{"Choose Save to Memories while viewing a snap."}else{"Use New snap to share a photo or video."}}}}
         div {class:"gallery-grid",for item in items {
             {let contact=cx.state.read().contacts.iter().find(|c|c.id==item.contact).cloned();let name=if item.outgoing{"You".into()}else{contact.map(|c|c.name).unwrap_or("Friend".into())};let img=item.sample.as_deref().map(sample_uri);let open=item.clone();let remove=item.id.clone();
-            rsx!{article {class:"gallery-card",button {class:"gallery-cover",onclick:move |_|open_item(cx,open.clone(),memories),if let Some(img)=img{img{src:"{img}",alt:""}}else{div {class:"media-placeholder",Icon{name:"camera"}}}span{class:"gallery-shade"}span{class:"gallery-overline",if memories{"KEPT BY YOU"}else{"{relative(item.created_at)}"}}span{class:"gallery-title","{item.caption}"}span{class:"gallery-name","{name}"}}if memories {button {class:"delete-memory",onclick:move |_|{if let Some(item)=cx.state.write().items.iter_mut().find(|i|i.id==remove){item.saved=false;item.memory_cipher=None;}cx.toast.set("Removed from Memories".into());},Icon{name:"close"}"Remove"}}}}
+            rsx!{article {class:"gallery-card",key:"{item.id}",button {class:"gallery-cover",onclick:move |_|open_item(cx,open.clone(),memories),if let Some(img)=img{img{src:"{img}",alt:""}}else{div {class:"media-placeholder",Icon{name:"camera"}}}span{class:"gallery-shade"}span{class:"gallery-overline",if item.sample.is_some(){"Sample · "}if memories{"Saved"}else if item.outgoing{"Sent · {relative(item.created_at)}"}else{"{relative(item.created_at)}"}}span{class:"gallery-title",if item.caption.is_empty(){"Open snap"}else{"{item.caption}"}}span{class:"gallery-name","{name}"}}if memories {button {class:"delete-memory",onclick:move |_|{if let Some(item)=cx.state.write().items.iter_mut().find(|i|i.id==remove){item.saved=false;item.memory_cipher=None;}cx.toast.set("Removed from Memories".into());},Icon{name:"close"}"Remove"}}}}
             }
         }}
     }}
@@ -479,7 +397,7 @@ fn relative(t: u64) -> String {
 
 fn open_item(mut cx: Ctx, item: Item, memory: bool) {
     if item.expired(now()) && !memory {
-        cx.toast.set("This moment has passed.".into());
+        cx.toast.set("This snap has expired.".into());
         return;
     }
     spawn(async move {
@@ -490,7 +408,7 @@ fn open_item(mut cx: Ctx, item: Item, memory: bool) {
             let ticket = item
                 .ticket
                 .as_ref()
-                .context("This moment is no longer available")?;
+                .context("This snap is no longer available")?;
             let cipher = if memory {
                 item.memory_cipher
                     .clone()
@@ -530,7 +448,7 @@ fn open_item(mut cx: Ctx, item: Item, memory: bool) {
                     )
                 };
                 if deadline.is_some_and(|d| d <= now()) {
-                    cx.toast.set("This moment has passed.".into());
+                    cx.toast.set("This snap has expired.".into());
                     return;
                 }
                 if !memory {
@@ -569,7 +487,7 @@ fn SnapViewer() -> Element {
         .is_some_and(|i| i.saved);
     let for_save = view.clone();
     rsx! {div {class:"viewer-backdrop",role:"dialog","aria-modal":"true","aria-label":"Snap viewer",
-        div {class:"viewer-top",span{class:"viewer-logo",Icon{name:"spark"}"n0-snap."}span{class:"viewer-timer",Icon{name:"clock"}if let Some(s)=remaining{"{s}s"}else{"In your Memories"}}button {class:"viewer-close",title:"Close snap",onclick:move |_|{if view.item.kind!="story"&&view.deadline.is_some(){if let Some(item)=cx.state.write().items.iter_mut().find(|i|i.id==view.item.id){item.opened_at=Some(now().saturating_sub(60));}}cx.viewer.set(None);},Icon{name:"close"}}}
+        div {class:"viewer-top",span{class:"viewer-logo","n0-snap"}span{class:"viewer-timer",Icon{name:"clock"}if let Some(s)=remaining{"{s}s"}else{"In your Memories"}}button {class:"viewer-close",title:"Close snap",onclick:move |_|{if view.item.kind!="story"&&view.deadline.is_some(){if let Some(item)=cx.state.write().items.iter_mut().find(|i|i.id==view.item.id){item.opened_at=Some(now().saturating_sub(60));}}cx.viewer.set(None);},Icon{name:"close"}}}
         if let Some(s)=remaining {div {class:"viewer-progress",div {style:"width:{s as f64 / 60.0 * 100.0}%"}}}
         div {class:"viewer-media",
             if view.mime.starts_with("video/"){video {src:"{view.uri}",autoplay:true,controls:true,playsinline:true}}
@@ -577,7 +495,7 @@ fn SnapViewer() -> Element {
             else {img {src:"{view.uri}",alt:"Snap content"}}
             div {class:"viewer-caption","{view.item.caption}"}
         }
-        div {class:"viewer-bottom",p {if saved{"Kept on this device."}else{"Here for a moment. Yours to keep if you choose."}}button {class:"save-memory",disabled:saved,onclick:move |_|{if let Some(item)=cx.state.write().items.iter_mut().find(|i|i.id==for_save.item.id){item.saved=true;item.memory_cipher=for_save.cipher.clone();}cx.toast.set("Saved to Memories on this device".into());},Icon{name:"bookmark"}if saved{"Saved to Memories"}else{"Save to Memories"}}}
+        div {class:"viewer-bottom",p {if saved{"Kept on this device."}else{"Save a copy on this device."}}button {class:"save-memory",disabled:saved,onclick:move |_|{if let Some(item)=cx.state.write().items.iter_mut().find(|i|i.id==for_save.item.id){item.saved=true;item.memory_cipher=for_save.cipher.clone();}cx.toast.set("Saved to Memories on this device".into());},Icon{name:"bookmark"}if saved{"Saved to Memories"}else{"Save to Memories"}}}
     }}
 }
 
@@ -589,10 +507,9 @@ async fn publish(
     kind: String,
     contacts: Vec<Contact>,
 ) -> Result<()> {
+    ensure!(!contacts.is_empty(), "Connect a friend before sending");
     ensure!(
-        contacts
-            .iter()
-            .all(|c| c.endpoint.is_some() || c.did.is_empty()),
+        contacts.iter().all(|c| c.endpoint.is_some()),
         "Exchange Snapcodes with this profile before sending"
     );
     let node = cx
@@ -603,7 +520,6 @@ async fn publish(
     let settings = cx.state.read().settings.clone();
     let (addr, token) = host_target(&node, &settings)?;
     let ticket = node.upload(&bytes, &mime, addr, token).await?;
-    let all_demo = contacts.iter().all(|c| c.endpoint.is_none());
     let mut failures = Vec::new();
     let mut delivered = 0;
     for contact in contacts {
@@ -643,11 +559,7 @@ async fn publish(
         cx.toast.set(if kind == "story" {
             "Story shared · available for 24 hours".into()
         } else {
-            if all_demo {
-                "Demo moment stored over iroh. Open it in this conversation.".into()
-            } else {
-                "Moment delivered over iroh.".into()
-            }
+            "Snap sent.".into()
         });
     }
     Ok(())
@@ -662,7 +574,7 @@ fn host_target(node: &Client, settings: &Settings) -> Result<(iroh::EndpointAddr
     } else {
         ensure!(
             !settings.endpoint.trim().is_empty(),
-            "Add your hosting endpoint in Your hosting first"
+            "Add an endpoint in Hosting first"
         );
         Ok((
             settings.endpoint.trim().parse::<iroh::EndpointId>()?.into(),
@@ -676,8 +588,24 @@ fn Composer() -> Element {
     let mut cx = use_context::<Ctx>();
     let mut chosen = use_signal(|| None::<(Vec<u8>, String, String)>);
     let mut caption = use_signal(String::new);
-    let mut kind = use_signal(|| "snap".to_string());
-    let mut recipient = use_signal(|| (cx.selected)());
+    let mut kind = use_signal(|| {
+        if (cx.page)() == Page::Stories {
+            "story"
+        } else {
+            "snap"
+        }
+        .to_string()
+    });
+    let mut recipient = use_signal(|| {
+        let state = cx.state.read();
+        state
+            .contacts
+            .iter()
+            .find(|c| c.id == (cx.selected)() && c.endpoint.is_some())
+            .or_else(|| state.contacts.iter().find(|c| c.endpoint.is_some()))
+            .map(|c| c.id.clone())
+            .unwrap_or_default()
+    });
     let mut busy = use_signal(|| false);
     let mut error = use_signal(String::new);
     let contacts: Vec<_> = cx
@@ -685,7 +613,7 @@ fn Composer() -> Element {
         .read()
         .contacts
         .iter()
-        .filter(|c| c.endpoint.is_some() || c.did.is_empty())
+        .filter(|c| c.endpoint.is_some())
         .cloned()
         .collect();
     let preview = chosen
@@ -693,25 +621,24 @@ fn Composer() -> Element {
         .as_ref()
         .map(|(b, m, _)| format!("data:{m};base64,{}", STANDARD.encode(b)));
     rsx! {div {class:"modal-backdrop",div {class:"modal composer",role:"dialog","aria-modal":"true","aria-label":"New snap",
-        div {class:"modal-heading",div{p{class:"eyebrow","A LITTLE SOMETHING"}h2{"Make their day."}}button{class:"icon-button",title:"Close",disabled:busy(),onclick:move |_|cx.compose.set(false),Icon{name:"close"}}}
+        div {class:"modal-heading",h2{"New snap"}button{class:"icon-button",title:"Close",disabled:busy(),onclick:move |_|cx.compose.set(false),Icon{name:"close"}}}
         div {class:"compose-tabs",button{class:if kind()=="snap"{"active"}else{""},onclick:move |_|kind.set("snap".into()),"Direct snap"}button{class:if kind()=="story"{"active"}else{""},onclick:move |_|kind.set("story".into()),"24-hour story"}}
-        button {class:"upload-area",disabled:busy(),onclick:move |_|{spawn(async move{if let Some(file)=rfd::AsyncFileDialog::new().add_filter("Photos & videos",&["jpg","jpeg","png","webp","gif","mp4","webm","mov"]).pick_file().await{
-            if let Ok(meta)=std::fs::metadata(file.path()){if meta.len()>network::MAX_MEDIA as u64{error.set("Choose a file smaller than 12 MB".into());return;}}
-            let name=file.file_name();let ext=file.path().extension().and_then(|s|s.to_str()).unwrap_or("").to_lowercase();let mime=match ext.as_str(){"jpg"|"jpeg"=>"image/jpeg","png"=>"image/png","gif"=>"image/gif","webp"=>"image/webp","mp4"=>"video/mp4","webm"=>"video/webm","mov"=>"video/quicktime",_=>""};
-            if mime.is_empty(){error.set("Unsupported media type".into());return;}let data=file.read().await;if data.len()>network::MAX_MEDIA{error.set("Choose a file smaller than 12 MB".into());return;}chosen.set(Some((data,mime.into(),name)));error.set(String::new());
-        }});},
+        button {class:"upload-area",disabled:busy(),onclick:move |_|{busy.set(true);spawn(async move{
+            match platform::pick_media().await {Ok(Some(media))=>{chosen.set(Some(media));error.set(String::new());},Ok(None)=>{},Err(e)=>error.set(e.to_string())}
+            busy.set(false);
+        });},
             if let Some(uri)=preview {if chosen.read().as_ref().is_some_and(|(_,m,_)|m.starts_with("video")){video{src:"{uri}",muted:true}}else{img{src:"{uri}",alt:"Your selected photo"}}span{class:"replace-media","Choose something else"}}
-            else {span{class:"upload-icon",Icon{name:"camera"}}strong{"A photo. A video. A little you."}p{"Choose from your device · up to 12 MB"}}
+            else {span{class:"upload-icon",Icon{name:"camera"}}strong{"Choose a photo or video"}p{"Choose from your device · up to 12 MB"}}
         }
-        if chosen.read().is_none(){div{class:"sample-picker",span{"Or try a sample"}for sample in ["coast","mountain","flowers"]{button{title:"Use {sample} sample",onclick:move |_|chosen.set(Some((sample_bytes(sample).to_vec(),"image/jpeg".into(),format!("{sample}.jpg")))),img{src:"{sample_uri(sample)}",alt:"{sample}"}}}}}
-        label {class:"field-label","A few words, if you want"}input{class:"field",placeholder:"Wish you were here…",value:"{caption}",maxlength:2000,oninput:move |e|caption.set(e.value())}
-        if kind()=="snap"{label{class:"field-label","For"}select{class:"field",value:"{recipient}",onchange:move |e|recipient.set(e.value()),for contact in contacts{option{value:"{contact.id}","{contact.name}" if contact.endpoint.is_none()&&contact.did.is_empty(){" (sample)"}else if contact.endpoint.is_none(){" (needs Snapcode)"}}}}}else{p{class:"form-hint","Shared with all added friends. Real peers must be online to receive the story invitation; media stays on your host."}}
+        label {class:"field-label","Caption (optional)"}input{class:"field",placeholder:"Add a caption",value:"{caption}",maxlength:2000,oninput:move |e|caption.set(e.value())}
+        if kind()=="snap"{label{class:"field-label","For"}select{class:"field",value:"{recipient}",onchange:move |e|recipient.set(e.value()),for contact in contacts{option{value:"{contact.id}","{contact.name}"}}}}else{p{class:"form-hint","Shared with all added friends. Real peers must be online to receive the story invitation; media stays on your host."}}
         if !error().is_empty(){p{class:"form-error",role:"alert","{error}"}}
         div{class:"modal-footer",span{class:"form-hint",if kind()=="snap"{"60 seconds to view. Can be saved."}else{"Visible for 24 hours."}}button{class:"primary",disabled:chosen.read().is_none()||busy(),onclick:move |_|{
-            let Some((bytes,mime,_))=chosen().clone()else{return;};let contacts:Vec<_>=cx.state.read().contacts.iter().filter(|c|if kind()=="story"{c.endpoint.is_some()||c.did.is_empty()}else{c.id==recipient()}).cloned().collect();
+            let Some((bytes,mime,_))=chosen().clone()else{return;};let contacts:Vec<_>=cx.state.read().contacts.iter().filter(|c|if kind()=="story"{c.endpoint.is_some()}else{c.id==recipient()}).cloned().collect();
             if contacts.is_empty(){error.set("Add a friend first".into());return;}busy.set(true);error.set(String::new());let caption=caption();let kind=kind();
-            spawn(async move{match publish(cx,bytes,mime,caption,kind,contacts).await{Ok(())=>cx.compose.set(false),Err(e)=>error.set(e.to_string())}busy.set(false);});
-        },if busy(){"Sending over iroh…"}else{"Send a moment"}Icon{name:"arrow"}}}
+            let destination=if kind=="story"{Page::Stories}else{Page::Snaps};
+            spawn(async move{match publish(cx,bytes,mime,caption,kind,contacts).await{Ok(())=>{cx.compose.set(false);cx.page.set(destination);},Err(e)=>error.set(e.to_string())}busy.set(false);});
+        },if busy(){"Sending…"}else{"Send"}Icon{name:"arrow"}}}
     }}}
 }
 
@@ -733,19 +660,27 @@ fn FriendRequests() -> Element {
     rsx! {
         if !requests.is_empty() {
             section { class:"request-panel",
-                div { class:"section-row",h2 {"Connection requests"}span {class:"chip","YOU CHOOSE WHO GETS IN"} }
+                div { class:"section-row",h2 {"Connection requests"} }
                 for request in requests {
                     { let invite=request.invite.clone();let accept=invite.clone();let remove=invite.clone();
                     rsx! {div {class:"request-row",key:"{invite.endpoint.id}-{request.outgoing}",
                         div {class:"avatar you",Icon{name:"people"}}
-                        div {class:"request-copy",strong {"{invite.name}"}p {class:"muted",if request.declined {"Request declined"}else if request.outgoing {"Waiting for acceptance · retries while this app is open"}else{"Wants to connect · device identity only"}}small {"Device {invite.endpoint.id}"}}
+                        div {class:"request-copy",strong {"{invite.name}"}p {class:"muted",if request.declined {"Request declined"}else if request.outgoing {"Waiting for acceptance · retries while this app is open"}else if invite.version==2 {"@{invite.handle} · verified account device"}else{"Wants to connect · device identity only"}}small {"Device {invite.endpoint.id}"}}
                         if !request.outgoing {button {class:"primary",disabled:cx.client.read().is_none(),onclick:move |_| {
                             let Some(node)=cx.client.read().clone() else {return;};
                             let id=accept.endpoint.id;
-                            cx.state.write().connect_friend(&accept);
-                            cx.state.write().declined_requests.retain(|e|*e!=id);
-                            spawn(async move {node.declined.write().await.remove(&id);node.allowed.write().await.insert(id);});
-                            cx.toast.set("Accepted. Their app will connect automatically on its next check.".into());
+                            let accept = accept.clone();
+                            spawn(async move {
+                                match node.authorize_friend(&accept).await {
+                                    Ok(()) => {
+                                        cx.state.write().connect_friend(&accept);
+                                        cx.state.write().declined_requests.retain(|e|*e!=id);
+                                        node.declined.write().await.remove(&id);
+                                        cx.toast.set("Accepted. Their app will connect automatically on its next check.".into());
+                                    }
+                                    Err(e) => cx.toast.set(format!("Device verification failed: {e}")),
+                                }
+                            });
                         },"Accept"}}
                         button {class:"secondary",onclick:move |_| {
                             let id=remove.endpoint.id;
@@ -766,7 +701,29 @@ fn FriendRequests() -> Element {
 fn Friends() -> Element {
     let mut cx = use_context::<Ctx>();
     let mut name = use_signal(|| cx.state.read().settings.name.clone());
-    let mut show_code = use_signal(|| false);
+    let friends: Vec<_> = cx
+        .state
+        .read()
+        .contacts
+        .iter()
+        .filter(|c| c.endpoint.is_some())
+        .cloned()
+        .collect();
+    rsx! {section {class:"friends-page",
+        devices_ui::DeviceRegistration {}
+        FriendRequests {}
+        div{class:"friend-intro",div{h2{"Your friends"}p{class:"muted","Browse Discover for new people, or use a Snapcode to request a connection."}}button{class:"primary",onclick:move |_|{cx.add_input.set(String::new());cx.add_profile.set(None);cx.add.set(true);},Icon{name:"qr"}"Add Snapcode"}}
+        div{class:"friend-grid",for contact in friends{div{class:"friend-card",Avatar{contact:contact.clone()}h3{"{contact.name}"}p{if contact.handle.is_empty(){"Connected device"}else{"@{contact.handle}"}}span{class:"chip","Connected device"}button{class:"text-button",onclick:move |_|{cx.selected.set(contact.id.clone());cx.compose.set(true);},"Send snap" Icon{name:"arrow"}}}}}
+        div{class:"identity-card",div{
+            label{class:"field-label","Your name on this device"}div{class:"inline-field",input{class:"field",value:"{name}",oninput:move |e|name.set(e.value()),maxlength:80}button{class:"secondary",onclick:move |_|{if !name().trim().is_empty(){cx.state.write().settings.name=name().trim().to_string();}},"Save"}}
+        }}
+        div{class:"mobile-account",p{"@{cx.account.read().profile.handle}"}button{class:"secondary",onclick:move |_|cx.page.set(Page::Hosting),"Hosting"}auth_ui::SignOut{}}
+    }}
+}
+
+#[component]
+fn MySnapcode() -> Element {
+    let mut cx = use_context::<Ctx>();
     let invite = cx
         .client
         .read()
@@ -784,12 +741,12 @@ fn Friends() -> Element {
             .ok()
         })
         .unwrap_or_default();
-    let svg = if show_code() {
+    let svg = if !invite.is_empty() {
         qrcode::QrCode::new(invite.as_bytes())
             .ok()
             .map(|q| {
                 q.render::<qrcode::render::svg::Color>()
-                    .min_dimensions(256, 256)
+                    .min_dimensions(384, 384)
                     .dark_color(qrcode::render::svg::Color("#18181b"))
                     .light_color(qrcode::render::svg::Color("#ffffff"))
                     .build()
@@ -798,40 +755,36 @@ fn Friends() -> Element {
     } else {
         String::new()
     };
-    let friends: Vec<_> = cx
-        .state
-        .read()
-        .contacts
-        .iter()
-        .filter(|c| c.endpoint.is_some() || c.did.is_empty())
-        .cloned()
-        .collect();
-    rsx! {section {class:"friends-page",
-        FriendRequests {}
-        div{class:"friend-intro",div{h2{"Already your people."}p{class:"muted","Browse Discover for new people, or use a Snapcode to request a connection."}}button{class:"primary",onclick:move |_|cx.add.set(true),Icon{name:"plus"}"Add a friend"}}
-        div{class:"friend-grid",for contact in friends{div{class:"friend-card",Avatar{contact:contact.clone()}h3{"{contact.name}"}p{if contact.handle.is_empty(){"Connected device"}else{"@{contact.handle}"}}span{class:"chip",if contact.endpoint.is_some(){"IROH CONTACT"}else if contact.did.is_empty(){"SAMPLE PROFILE"}else{"NEEDS SNAPCODE"}}button{class:"text-button",onclick:move |_|{cx.selected.set(contact.id.clone());cx.page.set(Page::Inbox);},"Open conversation" Icon{name:"arrow"}}}}}
-        div{class:"identity-card",div{p{class:"eyebrow","YOUR SNAPCODE"}h2{"An invitation to your corner."}p{class:"muted","Share your code so a friend can request a connection. You choose who gets in. This verifies a device, not an AT Protocol account."}
-        label{class:"field-label","Your name on this device"}div{class:"inline-field",input{class:"field",value:"{name}",oninput:move |e|name.set(e.value()),maxlength:80}button{class:"secondary",onclick:move |_|{if !name().trim().is_empty(){cx.state.write().settings.name=name().trim().to_string();}},"Save"}}
-        button{class:"text-button",onclick:move |_|show_code.set(!show_code()),if show_code(){"Hide my Snapcode"}else{"Show my Snapcode"}Icon{name:"qr"}}
-        if show_code(){textarea{class:"invite-text",readonly:true,value:"{invite}","aria-label":"Your n0-snap invitation"}p{class:"form-hint","Copy this invitation to a friend. They paste it in Add a friend; you accept their request here."}}
-        }if show_code(){div{class:"qr-card",dangerous_inner_html:"{svg}"}}}
-    }}
+    rsx! {div {class:"modal-backdrop",div{class:"modal snapcode-modal",role:"dialog","aria-modal":"true","aria-label":"My Snapcode",
+        div{class:"modal-heading",h2{"My Snapcode"}button{class:"icon-button",title:"Close",onclick:move |_|cx.my_code.set(false),Icon{name:"close"}}}
+        p{class:"muted","@{cx.account.read().profile.handle}"}
+        devices_ui::DeviceRegistration {}
+        if !svg.is_empty(){div{class:"qr-card own-snapcode",dangerous_inner_html:"{svg}"}}else{p{role:"status","Your Snapcode isn't available yet."}}
+        p{"Share this invitation with a friend. They add it in n0-snap; you accept their request in Friends."}
+        textarea{class:"invite-text",readonly:true,value:"{invite}","aria-label":"Your n0-snap invitation"}
+        p{class:"form-hint","On iPhone, open n0-snap → Add Snapcode → Scan QR code. Keep both apps open while connecting."}
+    }}}
 }
 
 #[component]
 fn AddFriend() -> Element {
     let mut cx = use_context::<Ctx>();
-    let mut input = use_signal(String::new);
-    let mut found = use_signal(|| None::<PublicProfile>);
+    let mut input = cx.add_input;
     let mut status = use_signal(String::new);
     let mut busy = use_signal(|| false);
-    rsx! {div{class:"modal-backdrop",div{class:"modal",role:"dialog","aria-modal":"true","aria-label":"Add a friend",
-        div{class:"modal-heading",div{p{class:"eyebrow","A FAMILIAR FACE"}h2{"Find a friend."}}button{class:"icon-button",title:"Close",onclick:move |_|cx.add.set(false),Icon{name:"close"}}}
-        p{class:"muted","Look up an AT Protocol handle, or paste a n0-snap Snapcode invitation."}
-        textarea{class:"field invite-input",placeholder:"alice.bsky.social or flicker://friend/…",value:"{input}",oninput:move |e|{input.set(e.value());found.set(None);},maxlength:16000}
-        if let Some(profile)=found(){div{class:"lookup-result",div{class:"avatar you","{profile.name.chars().next().unwrap_or('@')}"}div{strong{if profile.name.is_empty(){"{profile.handle}"}else{"{profile.name}"}}p{"@{profile.handle}"}small{"{profile.did}"}}}p{class:"form-hint","Public profile found. Ask this person for their n0-snap Snapcode to enable messaging."}}
+    let prompt = cx
+        .add_profile
+        .read()
+        .as_ref()
+        .map(|profile| format!("Paste @{}’s n0-snap Snapcode invitation.", profile.handle))
+        .unwrap_or_else(|| "Paste your friend's n0-snap Snapcode invitation.".into());
+    rsx! {div{class:"modal-backdrop",div{class:"modal",role:"dialog","aria-modal":"true","aria-label":"Add Snapcode",
+        div{class:"modal-heading",h2{"Add Snapcode"}button{class:"icon-button",title:"Close",disabled:busy(),onclick:move |_|cx.add.set(false),Icon{name:"close"}}}
+        p{class:"muted","{prompt}"}
+        ScanCode { input, status, busy }
+        textarea{class:"field invite-input","aria-label":"Snapcode invitation",placeholder:"flicker://friend/…",value:"{input}",disabled:busy(),oninput:move |e|{input.set(e.value());status.set(String::new());},maxlength:16000}
         if !status().is_empty(){p{class:"form-error",role:"status","{status}"}}
-        div{class:"modal-footer",span{class:"form-hint","Search names and handles in Discover."}button{class:"primary",disabled:busy()||input().trim().is_empty(),onclick:move |_|{
+        div{class:"modal-footer",span{class:"form-hint","They'll need to accept your request."}button{class:"primary",disabled:busy()||input().trim().is_empty(),onclick:move |_|{
             let value=input().trim().to_string();
             if value.starts_with("flicker://"){
                 match Invite::decode(&value){Ok(inv)=>{
@@ -853,7 +806,7 @@ fn AddFriend() -> Element {
                     busy.set(true);status.set(String::new());
                     spawn(async move {
                         match node.request_friend(&inv,own_invite(cx,&node)).await {
-                            Ok(FriendStatus::Accepted)=>{cx.state.write().connect_friend(&inv);node.allowed.write().await.insert(endpoint_id);cx.add.set(false);cx.toast.set("You're connected. Send a moment!".into());},
+                            Ok(FriendStatus::Accepted)=>{cx.state.write().connect_friend(&inv);node.allowed.write().await.insert(endpoint_id);cx.add.set(false);cx.toast.set("Connected.".into());},
                             Ok(FriendStatus::Pending)=>{cx.add.set(false);cx.page.set(Page::Friends);cx.toast.set("Request sent. We'll connect when they accept.".into());},
                             Ok(FriendStatus::Declined)=>{if let Some(pending)=cx.state.write().friend_requests.iter_mut().find(|r|r.outgoing&&r.invite.endpoint.id==endpoint_id){pending.declined=true;}status.set("This friend request was declined.".into());},
                             Err(e)=>status.set(format!("{e} Your request is saved in Friends and will retry while the app is open.")),
@@ -861,17 +814,32 @@ fn AddFriend() -> Element {
                         busy.set(false);
                     });
                 },Err(e)=>status.set(e.to_string())}
-            }else if let Some(profile)=found(){
-                if !cx.state.read().contacts.iter().any(|c|c.did==profile.did){cx.state.write().contacts.push(Contact{id:profile.did.clone(),did:profile.did,name:if profile.name.is_empty(){profile.handle.clone()}else{profile.name},handle:profile.handle,color:"#c3ccdc".into(),endpoint:None});}
-                cx.add.set(false);cx.toast.set("Profile added. Exchange Snapcodes to send media.".into());
             }else{
-                busy.set(true);status.set(String::new());spawn(async move{
-                    let result:Result<PublicProfile>=async{flicker::discovery::Discovery::new()?.profile(&value).await}.await;
-                    match result{Ok(p)=>found.set(Some(p)),Err(_)=>status.set("Couldn't find that profile. Check the full handle and your connection.".into())}busy.set(false);
-                });
+                status.set("Paste a Snapcode invitation starting with flicker://friend/.".into());
             }
-        },if busy(){"Looking…"}else if found.read().is_some(){"Add profile"}else if input().starts_with("flicker://"){"Request connection"}else{"Find profile"}}}
+        },if busy(){"Connecting…"}else{"Request connection"}}}
     }}}
+}
+
+#[component]
+fn ScanCode(
+    mut input: Signal<String>,
+    mut status: Signal<String>,
+    mut busy: Signal<bool>,
+) -> Element {
+    #[cfg(target_os = "ios")]
+    return rsx! {button{class:"secondary scan-code",disabled:busy(),onclick:move |_|{
+        busy.set(true);status.set(String::new());
+        spawn(async move {
+            match platform::scan_qr().await {Ok(Some(code))=>input.set(code),Ok(None)=>{},Err(e)=>status.set(e.to_string())}
+            busy.set(false);
+        });
+    },Icon{name:"camera"}"Scan QR code"}};
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = (input, status, busy);
+        rsx! {}
+    }
 }
 
 #[component]
@@ -890,19 +858,18 @@ fn Hosting() -> Element {
         .map(|c| c.local_store.endpoint.id().to_string())
         .unwrap_or("Starting…".into());
     rsx! {section{class:"hosting-page",
-        div{class:"host-explainer",span{class:"host-illustration",Icon{name:"cloud"}}div{p{class:"eyebrow","YOU PICK THE ADDRESS"}h2{"Your moments need a home."}p{"Your host holds encrypted photos and videos so friends can open them later. Run your own, or connect a cloud endpoint. The keys stay with you and the people you share with."}}}
+        p{class:"muted","Choose where encrypted media is stored. Files expire after 24 hours; saved Memories stay on this device."}
         div{class:"host-options",for (id,icon,title,desc) in [("local","laptop","This device","Ready now. Available while n0-snap is open."),("personal","server","My own server","An always-on endpoint, managed by you."),("cloud","cloud","Cloud endpoint","Connect a hosted n0-snap storage endpoint.")]{button{class:if mode()==id{"host-option chosen"}else{"host-option"},onclick:move |_|{mode.set(id.into());result.set(String::new());},Icon{name:icon}strong{"{title}"}p{"{desc}"}span{class:"radio-mark"}}}}
         div{class:"host-config",
             if mode()=="local"{h3{"Your local iroh endpoint"}p{class:"muted","Encrypted media is stored on this computer. Friends need this app to remain open to fetch it."}code{class:"endpoint-code","{local_id}"}}
             else{h3{if mode()=="personal"{"Connect your server"}else{"Connect a cloud host"}}p{class:"muted","Paste the endpoint ID printed by flicker-store and its write token. No cloud service has been provisioned automatically."}label{class:"field-label","Iroh endpoint ID"}input{class:"field",placeholder:"64-character endpoint public key",value:"{endpoint}",oninput:move |e|endpoint.set(e.value())}label{class:"field-label","Storage write token"}input{r#type:"password",class:"field",placeholder:"Your host's secret write token",value:"{token}",oninput:move |e|token.set(e.value())}}
-            div{class:"modal-footer",span{class:"form-hint","iroh 1.3 · encrypted media · 24h maximum storage"}button{class:"primary",disabled:testing(),onclick:move |_|{
+            div{class:"modal-footer",span{class:"form-hint","Test the connection before saving."}button{class:"primary",disabled:testing(),onclick:move |_|{
                 let setting=Settings{name:cx.state.read().settings.name.clone(),handle:cx.state.read().settings.handle.clone(),host_mode:mode(),endpoint:endpoint(),write_token:token()};
                 let Some(node)=cx.client.read().clone()else{result.set("iroh is still connecting".into());return;};testing.set(true);result.set(String::new());
-                spawn(async move{let check:Result<()>=async{let(addr,token)=host_target(&node,&setting)?;node.probe(addr,token).await}.await;match check{Ok(())=>{cx.state.write().settings=setting;result.set("Connected. New moments will use this host.".into());},Err(e)=>result.set(e.to_string())}testing.set(false);});
+                spawn(async move{let check:Result<()>=async{let(addr,token)=host_target(&node,&setting)?;node.probe(addr,token).await}.await;match check{Ok(())=>{cx.state.write().settings=setting;result.set("Connected. New snaps will use this host.".into());},Err(e)=>result.set(e.to_string())}testing.set(false);});
             },if testing(){"Connecting…"}else{"Test & save"}Icon{name:"arrow"}}}
             if !result().is_empty(){p{class:"host-result",role:"status","{result}"}}
         }
-        div{class:"hosting-facts",div{Icon{name:"lock"}strong{"Only encrypted media"}p{"Your storage host never receives the media decryption key."}}div{Icon{name:"clock"}strong{"Nothing stays by default"}p{"Host objects expire in 24 hours. Saved Memories live on your device."}}div{Icon{name:"people"}strong{"Your social identity travels"}p{"AT Protocol helps find people. Account sign-in and device attestations are coming next."}}}
     }}
 }
 
@@ -920,7 +887,6 @@ fn Avatar(contact: Contact) -> Element {
 #[component]
 fn Icon(name: String) -> Element {
     let path = match name.as_str() {
-        "inbox" => "M4 4h16v16H4z M4 13h4l2 3h4l2-3h4",
         "stories" => "M12 3a9 9 0 1 1-8.1 5 M3 3v5h5 M10 8l6 4-6 4z",
         "bookmark" => "M6 3h12v18l-6-4-6 4z",
         "people" => {

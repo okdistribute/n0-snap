@@ -1,12 +1,11 @@
 use super::*;
-use flicker::discovery::{Discovery, Profile, Suggestion};
+use flicker::discovery::{Discovery, Suggestion};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Search,
     Following,
     Connections,
-    Saved,
 }
 #[derive(Clone, Copy)]
 struct Browse {
@@ -47,7 +46,7 @@ fn load(mut cx: Ctx, mut b: Browse, more: bool) {
     let cursor = if more { (b.cursor)() } else { None };
     spawn(async move {
         let result: Result<(Vec<Suggestion>, Option<String>, String)> = async {
-            let api = Discovery::new()?;
+            let api = Discovery::authenticated(cx.account.read().session.clone())?;
             match mode {
                 Mode::Search => {
                     let page = api.search(&query, cursor.as_deref()).await?;
@@ -90,7 +89,6 @@ fn load(mut cx: Ctx, mut b: Browse, more: bool) {
                     );
                     Ok((people, None, note))
                 }
-                Mode::Saved => Ok((vec![], None, String::new())),
             }
         }
         .await;
@@ -125,9 +123,9 @@ fn load(mut cx: Ctx, mut b: Browse, more: bool) {
 pub(super) fn Discover() -> Element {
     let mut cx = use_context::<Ctx>();
     let mut b = Browse {
-        mode: use_signal(|| Mode::Search),
+        mode: use_signal(|| Mode::Following),
         query: use_signal(String::new),
-        actor: use_signal(|| cx.state.read().discovery_actor.clone()),
+        actor: use_signal(|| cx.account.read().profile.handle.clone()),
         results: use_signal(Vec::new),
         cursor: use_signal(|| None),
         busy: use_signal(|| false),
@@ -136,62 +134,46 @@ pub(super) fn Discover() -> Element {
         generation: use_signal(|| 0),
         loaded_query: use_signal(String::new),
     };
+    use_future(move || async move {
+        load(cx, b, false);
+    });
     let mode = (b.mode)();
-    let results = if mode == Mode::Saved {
-        cx.state
-            .read()
-            .contacts
-            .iter()
-            .filter(|c| !c.did.is_empty() && c.endpoint.is_none())
-            .map(|c| Suggestion {
-                profile: Profile {
-                    did: c.did.clone(),
-                    handle: c.handle.clone(),
-                    name: c.name.clone(),
-                    description: String::new(),
-                    avatar: None,
-                },
-                via: vec![],
-            })
-            .collect::<Vec<_>>()
-    } else {
-        (b.results)()
-    };
+    let results = (b.results)();
     rsx! {
         section {class:"discover-page",
             div {class:"discover-banner",
-                div {p {class:"eyebrow","GOOD PEOPLE. SMALL WORLD."}h2 {"A familiar face, or a new favorite."}p {class:"muted","Explore public AT Protocol profiles. Save someone interesting, then connect with a Snapcode."}}
-                button {class:"secondary",onclick:move |_|cx.add.set(true),Icon{name:"qr"}"Have a Snapcode?"}
+                p {class:"muted","Find people you follow. Connect through their verified PDS device records, or exchange a Snapcode."}
+                button {class:"secondary",onclick:move |_|{cx.add_input.set(String::new());cx.add_profile.set(None);cx.add.set(true);},Icon{name:"qr"}"Add Snapcode"}
             }
             div {class:"discover-tabs",role:"tablist","aria-label":"Discover people",
-                for (tab,label) in [(Mode::Search,"Search people"),(Mode::Following,"Following"),(Mode::Connections,"Follow connections"),(Mode::Saved,"Saved profiles")] {
+                for (tab,label) in [(Mode::Search,"Search people"),(Mode::Following,"Following"),(Mode::Connections,"Follow connections")] {
                     button {role:"tab","aria-selected":mode==tab,class:if mode==tab{"active"}else{""},onclick:move |_|{
                         b.mode.set(tab);b.error.set(String::new());
-                        if tab==Mode::Saved{let next=(b.generation)()+1;b.generation.set(next);b.busy.set(false);}else{load(cx,b,false);}
+                        load(cx,b,false);
                     },"{label}"}
                 }
             }
             if mode==Mode::Search {
                 form {class:"discover-search",onsubmit:move |event|{event.prevent_default();load(cx,b,false);},
                     Icon{name:"search"}
-                    input {"aria-label":"Search people by name or handle",placeholder:"A name, a handle, a familiar face…",value:"{b.query}",maxlength:256,oninput:move|event|b.query.set(event.value())}
+                    input {"aria-label":"Search people by name or handle",placeholder:"Name or handle",value:"{b.query}",maxlength:256,oninput:move|event|b.query.set(event.value())}
                     button {class:"primary",r#type:"submit",disabled:(b.busy)()||b.query.read().trim().chars().count()<2,"Find people" Icon{name:"arrow"}}
                 }
             } else if matches!(mode,Mode::Following|Mode::Connections) {
                 form {class:"network-picker",onsubmit:move |event|{event.prevent_default();load(cx,b,false);},
-                    label {r#for:"network-handle","Start with a Bluesky handle"}
+                    label {r#for:"network-handle","Bluesky handle"}
                     div {class:"inline-field",input {id:"network-handle",class:"field",placeholder:"you.bsky.social",value:"{b.actor}",maxlength:256,oninput:move|event|b.actor.set(event.value())}button {class:"primary",r#type:"submit",disabled:(b.busy)()||b.actor.read().trim().is_empty(),"Explore network"}}
-                    p {class:"form-hint","Use your handle or someone else's. This reads public follows; it doesn't sign you in."}
+                    p {class:"form-hint","Showing public follows. Following someone on Bluesky doesn't connect them in n0-snap."}
                 }
             }
-            div {class:"discover-meta",p {class:"muted",if mode==Mode::Saved{"Your saved profiles. A Snapcode is still needed to connect."}else if !(b.note)().is_empty(){"{b.note}"}else{"Public profiles · n0-snap membership isn't verified yet"}}span {class:"chip","ATPROTO → PEOPLE / IROH → MOMENTS"}}
+            div {class:"discover-meta",p {class:"muted",if !(b.note)().is_empty(){"{b.note}"}else{"Public Bluesky profiles · device records checked when you connect"}}}
             if !(b.error)().is_empty(){div {class:"form-error",role:"alert","{b.error}" button{class:"text-button",onclick:move |_|load(cx,b,false),"Try again"}}}
-            if (b.busy)(){div{class:"discovery-loading",role:"status",span{class:"dot pending"}"Finding your people…"}}
+            if (b.busy)(){div{class:"discovery-loading",role:"status",span{class:"dot pending"}"Loading profiles…"}}
             if results.is_empty() && !(b.busy)() && (b.error)().is_empty() {
-                div {class:"discovery-empty",span {class:"discovery-star","✳"}h2 {if mode==Mode::Saved{"Keep a little list of your people."}else if !(b.note)().is_empty(){"No people found here yet."}else{"Your world is one hello away."}}p {class:"muted",if mode==Mode::Saved{"Save a profile from search or a public follow network."}else if mode==Mode::Search{"Search by name or handle. You don't need an exact match."}else{"Enter a handle above to explore its public connections."}}}
+                div {class:"discovery-empty",h2 {if !(b.note)().is_empty(){"No profiles found"}else{"Find profiles"}}p {class:"muted",if mode==Mode::Search{"Search by name or handle. You don't need an exact match."}else{"Enter a handle above to explore its public connections."}}}
             }
             div {class:"discovery-grid",for entry in results {ProfileCard{key:"{entry.profile.did}",entry}}}
-            if mode!=Mode::Saved&&b.cursor.read().is_some(){div{class:"discover-more",button{class:"secondary",disabled:(b.busy)(),onclick:move |_|load(cx,b,true),"Load more people"}}}
+            if b.cursor.read().is_some(){div{class:"discover-more",button{class:"secondary",disabled:(b.busy)(),onclick:move |_|load(cx,b,true),"Load more people"}}}
         }
     }
 }
@@ -200,12 +182,6 @@ pub(super) fn Discover() -> Element {
 fn ProfileCard(entry: Suggestion) -> Element {
     let mut cx = use_context::<Ctx>();
     let profile = entry.profile;
-    let saved = cx
-        .state
-        .read()
-        .contacts
-        .iter()
-        .any(|c| c.did == profile.did);
     let mut broken_image = use_signal(|| false);
     let avatar = profile
         .avatar
@@ -218,25 +194,17 @@ fn ProfileCard(entry: Suggestion) -> Element {
         .filter_map(|s| s.chars().next())
         .collect();
     let via = entry.via.join(", ");
-    let save = profile.clone();
-    let remove = profile.clone();
+    let connect = profile.clone();
     rsx! {article {class:"discovery-card",
         div {class:"discovery-card-top",div {class:"discover-avatar",
             if let Some(url)=avatar {if !broken_image(){img{src:"{url}",alt:"",loading:"lazy",referrerpolicy:"no-referrer",onerror:move |_|broken_image.set(true)}}else{"{initials}"}}else{"{initials}"}
-        }span {class:"chip",if saved{"SAVED PROFILE"}else{"PUBLIC PROFILE"}}}
+        }}
         h3 {"{label}"}p {class:"discover-handle","@{profile.handle}"}
-        p {class:"discover-bio",if profile.description.is_empty(){"A new face in your orbit."}else{"{profile.description}"}}
+        if !profile.description.is_empty(){p {class:"discover-bio","{profile.description}"}}
         if !entry.via.is_empty(){p{class:"discover-via","Followed by {via}"}}
         div {class:"profile-actions",
-            if saved {
-                button {class:"secondary",onclick:move |_|cx.add.set(true),Icon{name:"qr"}"Connect with code"}
-                button {class:"icon-button",title:"Remove saved profile",onclick:move |_|cx.state.write().contacts.retain(|c|c.did!=remove.did||c.endpoint.is_some()),Icon{name:"close"}}
-            }else{
-                button {class:"primary",onclick:move |_|{
-                    if !cx.state.read().contacts.iter().any(|c|c.did==save.did){cx.state.write().contacts.push(Contact{id:save.did.clone(),did:save.did.clone(),name:save.label().to_string(),handle:save.handle.clone(),color:"#7c7cff".into(),endpoint:None});}
-                    cx.toast.set("Profile saved. Connect with their Snapcode when you're ready.".into());
-                },Icon{name:"plus"}"Save profile"}
-            }
+            devices_ui::ProfileDevices {profile:profile.clone()}
+            button {class:"secondary",onclick:move |_|{cx.add_input.set(String::new());cx.add_profile.set(Some(connect.clone()));cx.add.set(true);},Icon{name:"qr"}"Add Snapcode"}
         }
     }}
 }

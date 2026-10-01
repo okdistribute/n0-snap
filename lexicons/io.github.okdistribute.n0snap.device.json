@@ -1,0 +1,22 @@
+{
+  "lexicon": 1,
+  "id": "io.github.okdistribute.n0snap.device",
+  "description": "Experimental n0-snap atproto + iroh device binding. Not a standardized namespace. Signed DRISL record (excluding proof) plus signed repository inclusion are both required.",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "any",
+      "description": "Record key is the lowercase 64-character hex iroh endpoint ID. Delete the record to revoke account-based connections. Public data; never include secrets or relay tokens.",
+      "record": {
+        "type": "object",
+        "required": ["iss", "sub", "via", "proof"],
+        "properties": {
+          "iss": {"type": "string", "format": "did", "description": "Account DID; must equal the containing repository DID."},
+          "sub": {"type": "string", "format": "did", "description": "Ed25519 did:key encoding of the native iroh endpoint public key."},
+          "via": {"type": "array", "minLength": 1, "maxLength": 1, "items": {"type": "string", "const": "io.github.okdistribute.n0snap.friend/1"}},
+          "proof": {"type": "bytes", "maxLength": 64, "description": "64-byte Ed25519 signature over canonical DRISL CBOR of the complete record with proof omitted."}
+        }
+      }
+    }
+  }
+}

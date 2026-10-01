@@ -1,6 +1,10 @@
 //! Public AT discovery; these results are not proof of n0-snap membership or identity.
+use crate::auth::BlueskySession;
 use anyhow::{Context, Result, ensure};
+use atrium_api::agent::CloneWithProxy;
+use atrium_xrpc::{OutputDataOrBytes, XrpcClient, XrpcRequest, http::Method};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
@@ -44,20 +48,42 @@ pub struct Suggestion {
 #[derive(Clone)]
 pub struct Discovery {
     client: reqwest::Client,
+    session: Option<Arc<BlueskySession>>,
 }
 impl Discovery {
     pub fn new() -> Result<Self> {
         Ok(Self {
+            session: None,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()?,
         })
     }
-    async fn get<T: serde::de::DeserializeOwned>(
+    pub fn authenticated(session: Arc<BlueskySession>) -> Result<Self> {
+        let mut api = Self::new()?;
+        // Keep the original session pointed at the PDS for repo writes. Only
+        // profile requests carry the AppView proxy header (no shared mutation).
+        api.session = Some(Arc::new(session.clone_with_proxy(
+            "did:web:api.bsky.app".parse().expect("AppView DID"),
+            "bsky_appview",
+        )));
+        Ok(api)
+    }
+    async fn get<T: serde::de::DeserializeOwned + Send + Sync>(
         &self,
         method: &str,
         params: &[(&str, &str)],
     ) -> Result<T> {
+        if let Some(session) = &self.session {
+            let params: std::collections::BTreeMap<_, _> = params.iter().copied().collect();
+            let result = session.send_xrpc::<_, (), T, serde_json::Value>(&XrpcRequest {
+                method: Method::GET, nsid: method.into(), parameters: Some(params), input: None, encoding: None,
+            }).await.context("Could not load Bluesky profiles. Check your connection; if your session has expired, sign out and sign in again.")?;
+            return match result {
+                OutputDataOrBytes::Data(value) => Ok(value),
+                _ => anyhow::bail!("Bluesky returned an unreadable response"),
+            };
+        }
         let response = self
             .client
             .get(format!("https://public.api.bsky.app/xrpc/{method}"))

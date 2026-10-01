@@ -143,48 +143,9 @@ pub struct FriendRequest {
 
 impl Default for State {
     fn default() -> Self {
-        let contacts = [
-            ("mira", "Mira Chen", "mira.example", "#bdccc7"),
-            ("leo", "Leo Park", "leo.example", "#b8c6dd"),
-            ("june", "June Rivera", "june.example", "#ddc5b7"),
-            ("sam", "Sam Taylor", "sam.example", "#c4bdd5"),
-        ]
-        .into_iter()
-        .map(|(id, name, handle, color)| Contact {
-            id: id.into(),
-            name: name.into(),
-            handle: handle.into(),
-            did: String::new(),
-            color: color.into(),
-            endpoint: None,
-        })
-        .collect();
-        let mut items = vec![];
-        for (contact, caption, sample, ago, kind) in [
-            ("mira", "the long way home", "coast", 120, "snap"),
-            ("leo", "somewhere with no signal", "mountain", 840, "snap"),
-            ("june", "a little afternoon light", "flowers", 2100, "snap"),
-            ("mira", "out here for a while", "coast", 3600, "story"),
-            ("leo", "weekend state of mind", "mountain", 7200, "story"),
-            ("june", "stopped to look", "flowers", 10800, "story"),
-        ] {
-            items.push(Item {
-                id: uuid::Uuid::new_v4().to_string(),
-                contact: contact.into(),
-                caption: caption.into(),
-                kind: kind.into(),
-                created_at: now() - ago,
-                opened_at: None,
-                saved: false,
-                outgoing: false,
-                sample: Some(sample.into()),
-                ticket: None,
-                memory_cipher: None,
-            });
-        }
         Self {
-            contacts,
-            items,
+            contacts: Vec::new(),
+            items: Vec::new(),
             discovery_actor: String::new(),
             friend_requests: Vec::new(),
             declined_requests: Vec::new(),
@@ -207,8 +168,13 @@ impl State {
                 id: id.clone(),
                 name: invite.name.clone(),
                 handle: invite.handle.clone(),
-                // A device invitation doesn't prove ownership of a claimed AT identity.
-                did: String::new(),
+                // v2 invitations are only constructed by the verified PDS flow;
+                // external QR/deep links and the legacy wire protocol accept v1 only.
+                did: if invite.version == 2 {
+                    invite.did.clone()
+                } else {
+                    String::new()
+                },
                 color: "#7c7cff".into(),
                 endpoint: Some(invite.endpoint.clone()),
             });
@@ -249,6 +215,12 @@ pub fn data_dir() -> PathBuf {
         })
 }
 
+pub fn account_dir(root: &Path, did: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    root.join("accounts")
+        .join(hex::encode(Sha256::digest(did.as_bytes())))
+}
+
 pub fn private_write(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
@@ -268,6 +240,37 @@ pub fn private_write(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sample_item() -> Item {
+        Item {
+            id: uuid::Uuid::new_v4().to_string(),
+            contact: "test".into(),
+            caption: String::new(),
+            kind: "snap".into(),
+            created_at: now(),
+            opened_at: None,
+            saved: false,
+            outgoing: false,
+            sample: Some("coast".into()),
+            ticket: None,
+            memory_cipher: None,
+        }
+    }
+    #[test]
+    fn fresh_accounts_are_empty_and_isolated() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("flicker-accounts-{}", uuid::Uuid::new_v4()));
+        let alice = account_dir(&root, "did:plc:alice");
+        let bob = account_dir(&root, "did:plc:bob");
+        assert_ne!(alice, bob);
+        assert!(account_dir(&root, "../../other").starts_with(root.join("accounts")));
+        let mut state = State::default();
+        assert!(state.contacts.is_empty() && state.items.is_empty());
+        state.items.push(sample_item());
+        state.save(&alice)?;
+        assert!(State::load(&bob)?.items.is_empty());
+        assert_eq!(State::load(&alice)?.items.len(), 1);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn discovery_state_migrates_and_device_invites_do_not_verify_at_identity() -> Result<()> {
         let mut legacy = serde_json::to_value(State::default())?;
@@ -320,7 +323,7 @@ mod tests {
 
     #[test]
     fn snap_deadline_does_not_slide_on_reopen() {
-        let mut item = State::default().items.remove(0);
+        let mut item = sample_item();
         item.opened_at = Some(100);
         assert!(!item.expired(159));
         assert!(item.expired(160));
@@ -334,6 +337,7 @@ mod tests {
     fn restart_preserves_expiry_and_keeps_only_saved_samples() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("flicker-state-{}", uuid::Uuid::new_v4()));
         let mut state = State::default();
+        state.items = vec![sample_item(), sample_item()];
         state.items[0].opened_at = Some(now() - 61);
         state.items[1].opened_at = Some(now() - 61);
         state.items[1].saved = true;

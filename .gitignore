@@ -11,3 +11,4 @@ state.json
 state.tmp
 
 /n0-snap.app
+ios/**/xcuserdata/

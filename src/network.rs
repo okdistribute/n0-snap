@@ -292,12 +292,50 @@ struct FriendHello {
     invite: Invite,
 }
 
+#[cfg(feature = "app")]
+#[derive(Clone)]
+pub struct AccountPeers {
+    pub own: Arc<RwLock<Option<String>>>,
+    pub bindings: Arc<RwLock<std::collections::HashMap<iroh::EndpointId, String>>>,
+    directory: Arc<dyn crate::devices::DeviceDirectory>,
+}
+#[cfg(feature = "app")]
+impl AccountPeers {
+    async fn verify_pair(
+        &self,
+        local: iroh::EndpointId,
+        remote: iroh::EndpointId,
+        did: &str,
+    ) -> Result<()> {
+        let own = self
+            .own
+            .read()
+            .await
+            .clone()
+            .context("Sign in to connect by account")?;
+        tokio::try_join!(
+            self.directory.check(&own, local),
+            self.directory.check(did, remote)
+        )?;
+        Ok(())
+    }
+    async fn verify_media(&self, local: iroh::EndpointId, remote: iroh::EndpointId) -> Result<()> {
+        let did = self.bindings.read().await.get(&remote).cloned();
+        if let Some(did) = did {
+            self.verify_pair(local, remote, &did).await?;
+        }
+        Ok(())
+    }
+}
+
 pub struct Client {
     pub endpoint: Endpoint,
     pub local_store: Store,
     pub allowed: Arc<RwLock<HashSet<iroh::EndpointId>>>,
     pub declined: Arc<RwLock<HashSet<iroh::EndpointId>>>,
     pub request_token: String,
+    #[cfg(feature = "app")]
+    pub accounts: AccountPeers,
 }
 
 impl Client {
@@ -309,6 +347,21 @@ impl Client {
         dir: PathBuf,
         tx: mpsc::Sender<(iroh::EndpointId, Offer)>,
         friend_tx: mpsc::Sender<Invite>,
+    ) -> Result<Self> {
+        Self::start_inner(
+            dir,
+            tx,
+            friend_tx,
+            #[cfg(feature = "app")]
+            Arc::new(crate::devices::Directory::new()?),
+        )
+        .await
+    }
+    async fn start_inner(
+        dir: PathBuf,
+        tx: mpsc::Sender<(iroh::EndpointId, Offer)>,
+        friend_tx: mpsc::Sender<Invite>,
+        #[cfg(feature = "app")] directory: Arc<dyn crate::devices::DeviceDirectory>,
     ) -> Result<Self> {
         let request_path = dir.join("friend-request.token");
         let request_token = if request_path.exists() {
@@ -327,9 +380,13 @@ impl Client {
             t
         };
         let local_store = start_store(dir.join("host"), token).await?;
+        #[allow(unused_mut)]
+        let mut alpns = vec![INBOX_ALPN.to_vec(), FRIEND_ALPN.to_vec()];
+        #[cfg(feature = "app")]
+        alpns.push(crate::devices::FRIEND_ALPN.to_vec());
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret(&dir.join("device.key"))?)
-            .alpns(vec![INBOX_ALPN.to_vec(), FRIEND_ALPN.to_vec()])
+            .alpns(alpns)
             .bind()
             .await?;
         let allowed = Arc::new(RwLock::new(HashSet::new()));
@@ -339,6 +396,14 @@ impl Client {
         let rejected = declined.clone();
         let seen = Arc::new(Mutex::new(HashSet::new()));
         let friend_token = request_token.clone();
+        #[cfg(feature = "app")]
+        let accounts = AccountPeers {
+            own: Default::default(),
+            bindings: Default::default(),
+            directory,
+        };
+        #[cfg(feature = "app")]
+        let account_peers = accounts.clone();
         tokio::spawn(async move {
             let limit = Arc::new(Semaphore::new(8));
             while let Some(incoming) = ep.accept().await {
@@ -352,14 +417,27 @@ impl Client {
                 let friend_token = friend_token.clone();
                 let rejected = rejected.clone();
                 let seen = seen.clone();
+                #[cfg(feature = "app")]
+                let accounts = account_peers.clone();
+                #[cfg(feature = "app")]
+                let local = ep.id();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    let _ = tokio::time::timeout(Duration::from_secs(40), async {
                         let conn = incoming.await?;
+                        #[cfg(feature = "app")]
+                        if conn.alpn() == crate::devices::FRIEND_ALPN {
+                            return accept_account_friend(
+                                conn, local, accounts, peers, rejected, seen, friend_tx,
+                            )
+                            .await;
+                        }
                         if conn.alpn() == FRIEND_ALPN {
                             accept_friend(conn, peers, rejected, seen, friend_token, friend_tx)
                                 .await
                         } else {
+                            #[cfg(feature = "app")]
+                            accounts.verify_media(local, conn.remote_id()).await?;
                             accept_offer(conn, peers, tx).await
                         }
                     })
@@ -373,11 +451,17 @@ impl Client {
             allowed,
             declined,
             request_token,
+            #[cfg(feature = "app")]
+            accounts,
         })
     }
     /// Returns true once the recipient explicitly accepts. Repeating a pending hello
     /// checks acceptance without granting permission to send media.
     pub async fn request_friend(&self, target: &Invite, own: Invite) -> Result<FriendStatus> {
+        #[cfg(feature = "app")]
+        if target.version == 2 {
+            return self.request_account_friend(target, own).await;
+        }
         ensure!(
             !target.request_token.is_empty(),
             "This older Snapcode needs exchanging codes on both devices."
@@ -472,7 +556,12 @@ impl Client {
         .context("Host returned no media")
     }
     pub async fn send(&self, addr: EndpointAddr, offer: &Offer) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(12), async {
+        #[cfg(feature = "app")]
+        self.accounts
+            .verify_media(self.endpoint.id(), addr.id)
+            .await
+            .context("Account device registration is missing, revoked, or could not be verified")?;
+        tokio::time::timeout(Duration::from_secs(40), async {
             let conn = self.endpoint.connect(addr, INBOX_ALPN).await?;
             let (mut send, mut recv) = conn.open_bi().await?;
             send.write_all(&serde_json::to_vec(offer)?).await?;
@@ -491,6 +580,154 @@ impl Client {
         .await
         .context("Friend is offline. Both apps must be open to deliver a new snap invitation.")?
     }
+}
+
+#[cfg(feature = "app")]
+impl Client {
+    pub async fn authorize_friend(&self, invite: &Invite) -> Result<()> {
+        if invite.version == 2 {
+            self.accounts
+                .verify_pair(self.endpoint.id(), invite.endpoint.id, &invite.did)
+                .await?;
+            self.accounts
+                .bindings
+                .write()
+                .await
+                .insert(invite.endpoint.id, invite.did.clone());
+        }
+        self.allowed.write().await.insert(invite.endpoint.id);
+        Ok(())
+    }
+    async fn request_account_friend(
+        &self,
+        target: &Invite,
+        mut own: Invite,
+    ) -> Result<FriendStatus> {
+        self.accounts
+            .verify_pair(self.endpoint.id(), target.endpoint.id, &target.did)
+            .await
+            .context("Both devices need current, verifiable PDS device records")?;
+        own.version = 2;
+        own.did = self
+            .accounts
+            .own
+            .read()
+            .await
+            .clone()
+            .context("Sign in first")?;
+        own.request_token.clear();
+        // Resolve routes through iroh's endpoint discovery, never through record-supplied addresses.
+        own.endpoint = self.endpoint.id().into();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let conn = self
+                .endpoint
+                .connect(target.endpoint.id, crate::devices::FRIEND_ALPN)
+                .await?;
+            ensure!(
+                conn.remote_id() == target.endpoint.id,
+                "Connected device mismatch"
+            );
+            let (mut send, mut recv) = conn.open_bi().await?;
+            send.write_all(&serde_json::to_vec(&FriendHello {
+                token: String::new(),
+                invite: own,
+            })?)
+            .await?;
+            send.finish()?;
+            let reply: Response = serde_json::from_slice(&recv.read_to_end(4096).await?)?;
+            conn.close(0u32.into(), b"done");
+            ensure!(
+                reply.ok,
+                "{}",
+                reply
+                    .error
+                    .unwrap_or_else(|| "Account connection failed".into())
+            );
+            match reply.data.as_deref() {
+                Some("accepted") => Ok(FriendStatus::Accepted),
+                Some("pending") => Ok(FriendStatus::Pending),
+                Some("declined") => Ok(FriendStatus::Declined),
+                _ => anyhow::bail!("Invalid friend response"),
+            }
+        })
+        .await
+        .context("Your friend is offline. Keep both native apps open and retry.")?
+    }
+}
+
+#[cfg(feature = "app")]
+async fn accept_account_friend(
+    conn: Connection,
+    local: iroh::EndpointId,
+    accounts: AccountPeers,
+    allowed: Arc<RwLock<HashSet<iroh::EndpointId>>>,
+    declined: Arc<RwLock<HashSet<iroh::EndpointId>>>,
+    seen: Arc<Mutex<HashSet<iroh::EndpointId>>>,
+    tx: mpsc::Sender<Invite>,
+) -> Result<()> {
+    let remote = conn.remote_id();
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let result: Result<&str> = async {
+        let hello: FriendHello = serde_json::from_slice(&recv.read_to_end(16000).await?)?;
+        ensure!(
+            hello.invite.version == 2
+                && hello.invite.endpoint.id == remote
+                && hello.invite.did.len() <= 256
+                && hello.invite.request_token.is_empty()
+                && hello.token.is_empty(),
+            "Invalid account invitation"
+        );
+        if declined.read().await.contains(&remote) {
+            return Ok("declined");
+        }
+        accounts
+            .verify_pair(local, remote, &hello.invite.did)
+            .await?;
+        if allowed.read().await.contains(&remote) {
+            // Never silently rebind an existing account-linked device to another DID.
+            ensure!(
+                accounts
+                    .bindings
+                    .read()
+                    .await
+                    .get(&remote)
+                    .is_none_or(|did| did == &hello.invite.did),
+                "Device account changed; reconnect explicitly"
+            );
+            return Ok("accepted");
+        }
+        if seen.lock().await.contains(&remote) {
+            return Ok("pending");
+        }
+        // Names are loaded from the claimed *verified* DID, not supplied by the peer.
+        let profile = accounts.directory.profile(&hello.invite.did).await?;
+        ensure!(profile.did == hello.invite.did, "Profile identity mismatch");
+        let invite = Invite {
+            version: 2,
+            name: profile.label().chars().take(80).collect(),
+            handle: profile.handle,
+            did: hello.invite.did,
+            endpoint: remote.into(),
+            request_token: String::new(),
+        };
+        let mut seen = seen.lock().await;
+        if !seen.contains(&remote) {
+            ensure!(seen.len() < 128, "Too many pending requests");
+            tx.try_send(invite)
+                .context("Connection requests are busy")?;
+            seen.insert(remote);
+        }
+        Ok("pending")
+    }
+    .await;
+    let response = match result {
+        Ok(status) => Response::ok(Some(status.into())),
+        Err(e) => Response::error(e),
+    };
+    send.write_all(&serde_json::to_vec(&response)?).await?;
+    send.finish()?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+    Ok(())
 }
 
 async fn accept_friend(
@@ -627,6 +864,146 @@ mod tests {
             endpoint: client.endpoint.addr(),
             request_token: client.request_token.clone(),
         }
+    }
+
+    #[cfg(feature = "app")]
+    #[derive(Default)]
+    struct FixtureDirectory(std::sync::RwLock<HashSet<(String, iroh::EndpointId)>>);
+    #[cfg(feature = "app")]
+    impl crate::devices::DeviceDirectory for FixtureDirectory {
+        fn check<'a>(
+            &'a self,
+            did: &'a str,
+            endpoint: iroh::EndpointId,
+        ) -> futures_util::future::BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                ensure!(
+                    self.0.read().unwrap().contains(&(did.into(), endpoint)),
+                    "Record revoked or wrong device"
+                );
+                Ok(())
+            })
+        }
+        fn profile<'a>(
+            &'a self,
+            did: &'a str,
+        ) -> futures_util::future::BoxFuture<'a, Result<crate::discovery::Profile>> {
+            Box::pin(async move {
+                Ok(crate::discovery::Profile {
+                    did: did.into(),
+                    handle: "verified.test".into(),
+                    name: "Verified account".into(),
+                    description: String::new(),
+                    avatar: None,
+                })
+            })
+        }
+    }
+    #[cfg(feature = "app")]
+    #[tokio::test]
+    async fn account_requests_bind_remote_keys_require_consent_and_recheck_revocation() -> Result<()>
+    {
+        let dir = std::env::temp_dir().join(format!("n0-account-peers-{}", uuid::Uuid::new_v4()));
+        let directory = Arc::new(FixtureDirectory::default());
+        let (tx_a, _) = mpsc::channel(4);
+        let (friends_a, _) = mpsc::channel(4);
+        let (tx_b, mut media) = mpsc::channel(4);
+        let (friends_b, mut friends) = mpsc::channel(4);
+        let alice = Client::start_inner(dir.join("a"), tx_a, friends_a, directory.clone()).await?;
+        let bob = Client::start_inner(dir.join("b"), tx_b, friends_b, directory.clone()).await?;
+        *alice.accounts.own.write().await = Some("did:plc:alice".into());
+        *bob.accounts.own.write().await = Some("did:plc:bob".into());
+        directory.0.write().unwrap().extend([
+            ("did:plc:alice".into(), alice.endpoint.id()),
+            ("did:plc:bob".into(), bob.endpoint.id()),
+        ]);
+        // Seed a LAN route while retaining authenticated iroh key matching.
+        let connection = alice
+            .endpoint
+            .connect(bob.endpoint.addr(), crate::devices::FRIEND_ALPN)
+            .await?;
+        connection.close(0u32.into(), b"route known");
+        let mut target = invitation(&bob, "Bob");
+        target.version = 2;
+        target.did = "did:plc:bob".into();
+        target.request_token.clear();
+        let own = invitation(&alice, "Spoofed label");
+        assert_eq!(
+            alice.request_friend(&target, own.clone()).await?,
+            FriendStatus::Pending
+        );
+        let received = friends.recv().await.context("Expected verified request")?;
+        assert_eq!(received.version, 2);
+        assert_eq!(received.did, "did:plc:alice");
+        assert_eq!(received.name, "Verified account");
+        assert!(received.request_token.is_empty());
+        assert!(
+            bob.allowed.read().await.is_empty(),
+            "Registration alone must not grant access"
+        );
+        let mut wrong = target.clone();
+        wrong.did = "did:plc:alice".into();
+        assert!(alice.request_friend(&wrong, own.clone()).await.is_err());
+        // A signed-in client cannot send a claimed issuer unrelated to its TLS key.
+        let connection = alice
+            .endpoint
+            .connect(bob.endpoint.addr(), crate::devices::FRIEND_ALPN)
+            .await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let mut impersonation = received.clone();
+        impersonation.did = "did:plc:bob".into();
+        send.write_all(&serde_json::to_vec(&FriendHello {
+            token: String::new(),
+            invite: impersonation,
+        })?)
+        .await?;
+        send.finish()?;
+        let response: Response = serde_json::from_slice(&recv.read_to_end(4096).await?)?;
+        assert!(!response.ok);
+        connection.close(0u32.into(), b"done");
+        bob.authorize_friend(&received).await?;
+        assert_eq!(
+            alice.request_friend(&target, own.clone()).await?,
+            FriendStatus::Accepted
+        );
+        alice.authorize_friend(&target).await?;
+        let ticket = alice
+            .upload(
+                b"private",
+                "text/plain",
+                alice.local_store.endpoint.addr(),
+                alice.local_store.token.clone(),
+            )
+            .await?;
+        let offer = Offer {
+            id: uuid::Uuid::new_v4().to_string(),
+            caption: String::new(),
+            kind: "text".into(),
+            ticket,
+            created_at: now(),
+        };
+        alice.send(bob.endpoint.addr(), &offer).await?;
+        assert_eq!(media.recv().await.context("Expected media")?.1.id, offer.id);
+        directory
+            .0
+            .write()
+            .unwrap()
+            .remove(&("did:plc:alice".into(), alice.endpoint.id()));
+        assert!(alice.request_friend(&target, own).await.is_err());
+        assert!(alice.send(bob.endpoint.addr(), &offer).await.is_err());
+        assert!(
+            bob.accounts
+                .verify_media(bob.endpoint.id(), alice.endpoint.id())
+                .await
+                .is_err()
+        );
+        assert!(bob.authorize_friend(&received).await.is_err());
+        alice.endpoint.close().await;
+        bob.endpoint.close().await;
+        alice.local_store.endpoint.close().await;
+        bob.local_store.endpoint.close().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

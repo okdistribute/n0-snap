@@ -6,7 +6,9 @@ default-run = "flicker"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:dioxus", "dioxus/desktop", "dep:rfd", "dep:reqwest", "dep:qrcode"]
+desktop = ["app", "dioxus/desktop", "dep:rfd"]
+mobile = ["app", "dioxus/mobile"]
+app = ["dep:dioxus", "dep:reqwest", "dep:qrcode", "dep:atrium-oauth", "dep:atrium-api", "dep:atrium-identity", "dep:atrium-common", "dep:atrium-xrpc", "dep:hickory-resolver", "dep:serde_html_form", "dep:webbrowser", "dep:serde_ipld_dagcbor", "dep:ipld-core", "dep:bs58", "dep:p256", "dep:k256"]
 
 [dependencies]
 anyhow = "1"
@@ -22,14 +24,33 @@ hex = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 dioxus = { version = "0.7", optional = true }
-rfd = { version = "0.15", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 qrcode = { version = "0.14", default-features = false, features = ["svg"], optional = true }
+atrium-oauth = { version = "=0.1.7", default-features = false, optional = true }
+atrium-api = { version = "0.25.8", default-features = false, features = ["agent"], optional = true }
+atrium-identity = { version = "0.1.9", optional = true }
+atrium-common = { version = "0.1.4", optional = true }
+atrium-xrpc = { version = "0.12.4", optional = true }
+hickory-resolver = { version = "0.24", optional = true }
+serde_html_form = { version = "0.2", optional = true }
+webbrowser = { version = "1", optional = true }
+futures-util = "0.3"
+serde_ipld_dagcbor = { version = "0.6", optional = true }
+ipld-core = { version = "0.4", features = ["serde"], optional = true }
+bs58 = { version = "0.5", optional = true }
+p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+k256 = { version = "0.13", features = ["ecdsa"], optional = true }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+rfd = { version = "0.15", optional = true }
+
+[build-dependencies]
+cc = "1"
 
 [[bin]]
 name = "flicker"
 path = "src/main.rs"
-required-features = ["desktop"]
+required-features = ["app"]
 
 [[bin]]
 name = "flicker-store"
